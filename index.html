@@ -14,6 +14,7 @@
 <body>
 <div id="wrap"><canvas id="c1" width="640" height="512"></canvas><canvas id="c2" width="640" height="512" style="display:none"></canvas></div>
 <p id="help"></p>
+<script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
 <script>
 // 원작: 시그마/세이부 전자 "Ponpoko"(너구리, 1982) 규칙을 따른 구현
 const FY = [150, 230, 310, 390, 470];            // 각 층 바닥 y
@@ -60,7 +61,7 @@ class Game {
     this.cv = cv; this.g = cv.getContext('2d'); this.km = keymap;
     this.race = !!opt.race; this.N = opt.N || 20; this.name = opt.name || '';
     this.stage = 1; this.score = 0; this.lives = 3; this.frame = 0; this.elapsed = 0; this.fin = 0;
-    this.best = opt.best || 0;
+    this.best = opt.best || 0; this.remote = !!opt.remote;
     this.startStage();
   }
   get diff() { return this.race ? Math.round(this.stage * 20 / this.N) : Math.min(this.stage, 20); }
@@ -129,7 +130,7 @@ class Game {
         tacks.push({ fl, x }); made++;
       }
     }
-    for (let i = 0; i < 12; i++) { const fl = i % 5; foods.push({ fl, x: place(fl, 36) }); }
+    for (let i = 0; i < 12; i++) { const fl = i % 5; foods.push({ id: i, fl, x: place(fl, 36) }); }
     { const fl = Math.floor(r() * 5); this.jar = { fl, x: place(fl, 36) }; }
     // 도달 가능성 검사: 안 되면 높은 벽을 낮은 벽으로 바꿈
     const region = (fl, x) => walls.filter(w => w.full && w.fl === fl && w.x < x).length;
@@ -162,9 +163,28 @@ class Game {
   die() { const p = this.p; if (p.mode === 'die') return; p.mode = 'die'; p.vy = -3; p.t = 0; beep(400, .6, 'sawtooth', .05, 80); }
   inGap(fl, x) { return this.gaps[fl].some(([a, b]) => x > a && x < b); }
 
+  // ----- 온라인: 상태 전송/반영 -----
+  snap() {
+    const p = this.p, r = v => Math.round(v * 10) / 10;
+    return { stage: this.stage, f: this.foods.reduce((m, f) => m | 1 << f.id, 0), j: !!this.jar,
+      e: this.enemies.map(e => [r(e.x), e.dir]),
+      p: { x: r(p.x), y: r(p.y), py: r(p.py), face: p.face, mode: p.mode, step: p.step, rot: p.rot },
+      timer: this.timer, el: this.elapsed, st: this.state, fin: this.fin, sc: this.score, pt: this.penaltyT || 0 };
+  }
+  apply(s) {
+    if (s.st !== 'finished' && s.stage !== this.stage) { this.stage = s.stage; this.startStage(true); }
+    else this.stage = s.stage;
+    this.foods = this.foods.filter(f => s.f & 1 << f.id);
+    if (!s.j) this.jar = null;
+    s.e.forEach((v, i) => { if (this.enemies[i]) { this.enemies[i].x = v[0]; this.enemies[i].dir = v[1]; } });
+    Object.assign(this.p, s.p);
+    this.timer = s.timer; this.elapsed = s.el; this.state = s.st; this.fin = s.fin; this.score = s.sc; this.penaltyT = s.pt;
+  }
+
   // ----- 갱신 -----
   update() {
     this.frame++;
+    if (this.remote) return;
     if (this.state === 'finished' || this.state === 'over') return;
     if (this.race) this.elapsed++;
     if (this.state === 'clear') {
@@ -362,6 +382,7 @@ const fmt = f => { const s = f / 60; return Math.floor(s / 60) + ':' + (s % 60).
 // ----- 메뉴 / 모드 관리 -----
 const c1 = document.getElementById('c1'), c2 = document.getElementById('c2'), help = document.getElementById('help');
 let mode = 'title', games = [], countdown = 0, result = null, tf = 0, best = 0;
+let peer = null, conn = null, roomCode = '', netMsg = '', oppFin = 0, myFinSent = false, resolveAt = 0, snapT = 0;
 
 function startSolo() {
   mode = 'solo'; c2.style.display = 'none'; games = [new Game(c1, KEYMAP.solo, { best })];
@@ -372,7 +393,52 @@ function startRace(N) {
   games = [new Game(c1, KEYMAP.p1, { race: true, N, name: '1P' }), new Game(c2, KEYMAP.p2, { race: true, N, name: '2P' })];
   help.textContent = '1P: W A S D 이동, F 점프   |   2P: ← → ↑ ↓ 이동, / 점프   |   Esc : 메뉴';
 }
-function toTitle() { mode = 'title'; c2.style.display = 'none'; games = []; help.textContent = ''; }
+function toTitle() {
+  mode = 'title'; c2.style.display = 'none'; games = []; help.textContent = '';
+  try { if (peer) peer.destroy(); } catch (e) {}
+  peer = conn = null;
+}
+
+// ----- 온라인 대결 (WebRTC P2P, PeerJS 중계 서버는 연결을 맺을 때만 사용) -----
+function netFail(msg) { toTitle(); netMsg = msg; }
+function startOnline(N) {
+  mode = 'online'; c2.style.display = ''; result = null; countdown = 180; oppFin = 0; myFinSent = false; resolveAt = 0;
+  games = [new Game(c1, KEYMAP.solo, { race: true, N, name: '나' }), new Game(c2, null, { race: true, N, name: '상대', remote: true })];
+  help.textContent = '← → ↑ ↓ (또는 WASD) : 이동/사다리  |  스페이스(F) : 점프  |  오른쪽 화면은 상대방의 실시간 화면  |  Esc : 나가기';
+}
+function setupConn(c) {
+  conn = c;
+  c.on('data', d => {
+    if (d.t === 'start' && mode === 'wait') startOnline(d.N);
+    else if (d.t === 'snap' && games[1]) games[1].apply(d.s);
+    else if (d.t === 'fin') { oppFin = d.fin; if (!resolveAt) resolveAt = performance.now() + 1500; }
+  });
+  c.on('close', () => { if (mode === 'online' || mode === 'wait') netFail('상대방과의 연결이 끊어졌습니다.'); });
+}
+function hostRoom() {
+  if (typeof Peer === 'undefined') { netMsg = '온라인 라이브러리를 불러오지 못했습니다.'; return; }
+  const n = Number(prompt('스테이지 수를 고르세요 (5 / 10 / 20)', '10'));
+  const N = [5, 10, 20].includes(n) ? n : 10;
+  const A = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  roomCode = Array.from({ length: 4 }, () => A[Math.floor(Math.random() * A.length)]).join('');
+  netMsg = ''; mode = 'wait'; c2.style.display = 'none'; help.textContent = '';
+  peer = new Peer('neoguri-' + roomCode);
+  peer.on('error', e => netFail('연결 오류: ' + e.type));
+  peer.on('connection', c => {
+    if (conn) { c.close(); return; }
+    setupConn(c);
+    c.on('open', () => { c.send({ t: 'start', N }); startOnline(N); });
+  });
+}
+function joinRoom() {
+  if (typeof Peer === 'undefined') { netMsg = '온라인 라이브러리를 불러오지 못했습니다.'; return; }
+  const code = (prompt('방 코드를 입력하세요 (4글자)') || '').trim().toUpperCase();
+  if (!code) return;
+  roomCode = ''; netMsg = ''; mode = 'wait'; c2.style.display = 'none';
+  peer = new Peer();
+  peer.on('error', e => netFail(e.type === 'peer-unavailable' ? '해당 방을 찾을 수 없습니다.' : '연결 오류: ' + e.type));
+  peer.on('open', () => setupConn(peer.connect('neoguri-' + code, { reliable: true })));
+}
 
 function onKey(code) {
   if (code === 'Escape') { toTitle(); return; }
@@ -381,6 +447,8 @@ function onKey(code) {
     else if (code === 'Digit2' || code === 'Numpad2') startRace(5);
     else if (code === 'Digit3' || code === 'Numpad3') startRace(10);
     else if (code === 'Digit4' || code === 'Numpad4') startRace(20);
+    else if (code === 'Digit5' || code === 'Numpad5') hostRoom();
+    else if (code === 'Digit6' || code === 'Numpad6') joinRoom();
   } else if (code === 'Enter' && (mode === 'raceover' || (mode === 'solo' && games[0].state === 'over'))) {
     if (mode === 'solo') best = Math.max(best, games[0].best);
     toTitle();
@@ -390,6 +458,26 @@ function onKey(code) {
 function step() {
   if (mode === 'title') { tf++; return; }
   if (mode === 'solo') { games[0].update(); return; }
+  if (mode === 'wait') { tf++; return; }
+  if (mode === 'online') {
+    games[1].frame++;
+    if (countdown > 0) { countdown--; return; }
+    const me = games[0];
+    me.update();
+    if (++snapT % 3 === 0 && conn && conn.open) conn.send({ t: 'snap', s: me.snap() });
+    if (me.state === 'finished' && !myFinSent) {
+      myFinSent = true;
+      if (conn && conn.open) { conn.send({ t: 'snap', s: me.snap() }); conn.send({ t: 'fin', fin: me.fin }); }
+      if (!resolveAt) resolveAt = performance.now() + 1500;
+    }
+    if (resolveAt && performance.now() >= resolveAt) {
+      const mine = me.state === 'finished' ? me.fin : 0;
+      result = mine && oppFin ? (mine < oppFin ? 0 : oppFin < mine ? 1 : -1) : mine ? 0 : 1;
+      if (oppFin) { games[1].fin = oppFin; games[1].state = 'finished'; }
+      mode = 'raceover';
+    }
+    return;
+  }
   if (mode === 'race') {
     if (countdown > 0) { countdown--; return; }
     games.forEach(g => g.update());
@@ -408,12 +496,11 @@ function drawTitle() {
   g.textAlign = 'center'; g.textBaseline = 'middle';
   g.fillStyle = '#ffd54f'; g.font = 'bold 72px "Malgun Gothic",sans-serif'; g.fillText('너구리', 320, 90);
   g.fillStyle = '#fff'; g.font = '22px "Malgun Gothic",sans-serif';
-  g.fillText('1  혼자 하기', 320, 190);
-  g.fillText('2  2인 대결 (5 스테이지)', 320, 230);
-  g.fillText('3  2인 대결 (10 스테이지)', 320, 270);
-  g.fillText('4  2인 대결 (20 스테이지)', 320, 310);
+  ['1  혼자 하기', '2  한 컴퓨터에서 2인 대결 (5 스테이지)', '3  한 컴퓨터에서 2인 대결 (10 스테이지)', '4  한 컴퓨터에서 2인 대결 (20 스테이지)',
+   '5  온라인 대결 - 방 만들기', '6  온라인 대결 - 방 참가'].forEach((t, i) => g.fillText(t, 320, 160 + i * 36));
   g.fillStyle = '#aaa'; g.font = '15px "Malgun Gothic",sans-serif';
-  g.fillText('대결: 같은 스테이지를 동시에 시작해 먼저 전부 깨는 사람이 승리 (죽으면 스테이지 재시작 + 5초 페널티)', 320, 350);
+  g.fillText('대결: 같은 스테이지를 동시에 시작해 먼저 전부 깨는 사람이 승리 (죽으면 스테이지 재시작 + 5초 페널티)', 320, 385);
+  if (netMsg) { g.fillStyle = '#ff5252'; g.font = 'bold 18px "Malgun Gothic",sans-serif'; g.fillText(netMsg, 320, 440); }
   const dummy = new Game(c1, KEYMAP.solo, {}).p;
   Object.assign(dummy, { x: 320 + Math.sin(tf / 20) * 200, y: 400, face: Math.cos(tf / 20) > 0 ? 1 : -1, step: tf, mode: 'walk', py: 0 });
   Game.prototype.drawPlayer.call({ g }, dummy);
@@ -427,13 +514,25 @@ function overlay(game, text, sub) {
   g.fillStyle = '#fff'; g.font = '22px "Malgun Gothic",sans-serif'; g.fillText(sub, 320, 290);
 }
 
+function drawWait() {
+  const g = c1.getContext('2d');
+  g.fillStyle = '#0a0a2a'; g.fillRect(0, 0, 640, 512);
+  g.textAlign = 'center'; g.textBaseline = 'middle'; g.fillStyle = '#ffd54f'; g.font = 'bold 40px "Malgun Gothic",sans-serif';
+  g.fillText(roomCode ? '방 코드' : '연결 중...', 320, 150);
+  if (roomCode) { g.font = 'bold 110px monospace'; g.fillStyle = '#fff'; g.fillText(roomCode, 320, 260); }
+  g.fillStyle = '#aaa'; g.font = '20px "Malgun Gothic",sans-serif';
+  g.fillText(roomCode ? '상대방이 메뉴에서 6번을 눌러 이 코드를 입력하면 시작됩니다' : '방에 접속하는 중입니다', 320, 360);
+  g.fillText('Esc : 취소', 320, 410);
+}
+
 function render() {
   if (mode === 'title') { drawTitle(); return; }
+  if (mode === 'wait') { drawWait(); return; }
   games.forEach(g => g.draw());
-  if (mode === 'race' && countdown > 0) {
+  if ((mode === 'race' || mode === 'online') && countdown > 0) {
     const t = Math.ceil(countdown / 60);
     games.forEach(g => overlay(g, String(t), '준비!'));
-  } else if (mode === 'race' && games[0].elapsed < 60) {
+  } else if ((mode === 'race' || mode === 'online') && games[0].elapsed < 60) {
     games.forEach(g => overlay(g, 'GO!', ''));
   }
   if (mode === 'raceover') {
