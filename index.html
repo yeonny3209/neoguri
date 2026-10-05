@@ -1,0 +1,456 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>너구리</title>
+<style>
+  html,body{margin:0;background:#111;color:#eee;font-family:"Malgun Gothic",sans-serif;text-align:center}
+  #wrap{display:flex;justify-content:center;gap:8px;padding:8px}
+  canvas{flex:1 1 0;min-width:0;max-width:640px;background:#000;image-rendering:pixelated;border:3px solid #444;box-sizing:border-box}
+  p{margin:4px;font-size:14px;color:#aaa}
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c1" width="640" height="512"></canvas><canvas id="c2" width="640" height="512" style="display:none"></canvas></div>
+<p id="help"></p>
+<script>
+// 원작: 시그마/세이부 전자 "Ponpoko"(너구리, 1982) 규칙을 따른 구현
+const FY = [150, 230, 310, 390, 470];            // 각 층 바닥 y
+const SCORES = [10, 20, 30, 50, 100, 200, 300, 500, 1000, 2000, 3000, 5000];
+const FOODS = ['🥕','🍎','🍌','🍇','🍓','🍉','🍒','🍑','🍍','🥝','🍅','🍆','🌽','🥔','🍄','🥜','🍞','🍔','🍗','🍺'];
+const ENEMY = [ {c:'#43a047', s:.7}, {c:'#29b6f6', s:1.1}, {c:'#e53935', s:1.6}, {c:'#9e9d24', s:.35, snake:true} ];
+const KEYMAP = {
+  solo: { L:['ArrowLeft','KeyA'], R:['ArrowRight','KeyD'], U:['ArrowUp','KeyW'], D:['ArrowDown','KeyS'], J:['Space','KeyF','Slash'] },
+  p1:   { L:['KeyA'], R:['KeyD'], U:['KeyW'], D:['KeyS'], J:['KeyF'] },
+  p2:   { L:['ArrowLeft'], R:['ArrowRight'], U:['ArrowUp'], D:['ArrowDown'], J:['Slash','Period'] },
+};
+const PENALTY = 300;   // 대결 모드에서 죽으면 +5초
+
+const keys = {};
+addEventListener('keydown', e => {
+  keys[e.code] = true;
+  if (e.code.startsWith('Arrow') || e.code === 'Space' || e.code === 'Slash') e.preventDefault();
+  onKey(e.code);
+});
+addEventListener('keyup', e => keys[e.code] = false);
+const down = list => list.some(k => keys[k]);
+
+let ac;
+function beep(f, d = .08, type = 'square', vol = .04, f2) {
+  try {
+    ac = ac || new AudioContext();
+    const o = ac.createOscillator(), v = ac.createGain();
+    o.type = type; o.frequency.setValueAtTime(f, ac.currentTime);
+    if (f2) o.frequency.linearRampToValueAtTime(f2, ac.currentTime + d);
+    v.gain.setValueAtTime(vol, ac.currentTime); v.gain.linearRampToValueAtTime(0, ac.currentTime + d);
+    o.connect(v); v.connect(ac.destination); o.start(); o.stop(ac.currentTime + d);
+  } catch (e) {}
+}
+
+function rng(seed) {
+  return () => { seed |= 0; seed = seed + 0x6D2B79F5 | 0; let t = Math.imul(seed ^ seed >>> 15, 1 | seed);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; };
+}
+
+const WALL_FULL = 68, WALL_LOW = 30;
+
+class Game {
+  constructor(cv, keymap, opt) {
+    this.cv = cv; this.g = cv.getContext('2d'); this.km = keymap;
+    this.race = !!opt.race; this.N = opt.N || 20; this.name = opt.name || '';
+    this.stage = 1; this.score = 0; this.lives = 3; this.frame = 0; this.elapsed = 0; this.fin = 0;
+    this.best = opt.best || 0;
+    this.startStage();
+  }
+  get diff() { return this.race ? Math.round(this.stage * 20 / this.N) : Math.min(this.stage, 20); }
+  get foodIcon() { return FOODS[Math.max(1, Math.min(this.diff, 20)) - 1]; }
+
+  // ----- 스테이지 생성 -----
+  build(st) {
+    const r = rng(st * 7919 + 13), n = st;
+    const ladders = this.ladders = [], gaps = this.gaps = [[], [], [], [], []];
+    const walls = this.walls = [], tacks = this.tacks = [], foods = this.foods = [], enemies = this.enemies = [];
+    let prev = [];
+    for (let top = 0; top < 4; top++) {
+      const xs = [];
+      for (let t = 0; xs.length < 2; t++) {
+        const x = 60 + Math.floor(r() * 520), relax = t > 200 ? 60 : 0;
+        if (xs.every(v => Math.abs(v - x) > 180 - relax) && prev.every(v => Math.abs(v - x) > 100 - relax)) xs.push(x);
+      }
+      xs.forEach(x => ladders.push({ x, top })); prev = xs;
+    }
+    const ladXs = fl => ladders.filter(l => l.top === fl || l.top === fl - 1).map(l => l.x);
+    // 구멍
+    for (let fl = 0; fl < 5; fl++) {
+      const cnt = n < 2 ? 0 : Math.min(2, Math.floor(r() * (1 + n / 5)));
+      for (let t = 0, made = 0; t < 40 && made < cnt; t++) {
+        const w = 44 + r() * 16 + Math.min(n, 10) * 1.5, x0 = 70 + r() * 440;
+        if (ladXs(fl).some(v => v > x0 - 34 && v < x0 + w + 34)) continue;
+        if (gaps[fl].some(([a, b]) => x0 < b + 90 && x0 + w > a - 90)) continue;
+        gaps[fl].push([x0, x0 + w]); made++;
+      }
+    }
+    // 벽 (낮은 벽은 롱 점프로만 넘을 수 있고, 높은 벽은 완전히 막힘)
+    for (let fl = 0; fl < 5; fl++) {
+      const cnt = n < 3 ? 0 : Math.min(2, Math.floor(r() * (1 + n / 6)));
+      for (let t = 0, made = 0; t < 40 && made < cnt; t++) {
+        const x = 80 + r() * 480, full = r() < .4;
+        if (fl === 4 && x < 110) continue;
+        if (ladXs(fl).some(v => Math.abs(v - x) < 34)) continue;
+        if (gaps[fl].some(([a, b]) => x > a - 60 && x < b + 60)) continue;
+        if (walls.some(w => w.fl === fl && Math.abs(w.x - x) < 130)) continue;
+        walls.push({ fl, x, full }); made++;
+      }
+    }
+    // 완전히 막힌 벽 때문에 도달 못 하는 구역이 없도록 검증은 먹이 배치 후에 수행
+    const place = (fl, margin) => {
+      for (let t = 0; t < 200; t++) {
+        const x = 30 + r() * 580;
+        if (fl === 4 && x < 90) continue;
+        if (ladXs(fl).some(v => Math.abs(v - x) < 18)) continue;
+        if (gaps[fl].some(([a, b]) => x > a - 20 && x < b + 20)) continue;
+        if (walls.some(w => w.fl === fl && Math.abs(w.x - x) < 22)) continue;
+        if (foods.some(f => f.fl === fl && Math.abs(f.x - x) < margin)) continue;
+        return x;
+      }
+      return 300;
+    };
+    // 압정
+    for (let fl = 0; fl < 5; fl++) {
+      const cnt = Math.floor(r() * (1 + n / 6));
+      for (let t = 0, made = 0; t < 40 && made < cnt; t++) {
+        const x = 40 + r() * 560;
+        if (fl === 4 && x < 140) continue;
+        if (ladXs(fl).some(v => Math.abs(v - x) < 40)) continue;
+        if (gaps[fl].some(([a, b]) => x > a - 34 && x < b + 34)) continue;
+        if (walls.some(w => w.fl === fl && Math.abs(w.x - x) < 44)) continue;
+        if (tacks.some(k => k.fl === fl && Math.abs(k.x - x) < 70)) continue;
+        tacks.push({ fl, x }); made++;
+      }
+    }
+    for (let i = 0; i < 12; i++) { const fl = i % 5; foods.push({ fl, x: place(fl, 36) }); }
+    { const fl = Math.floor(r() * 5); this.jar = { fl, x: place(fl, 36) }; }
+    // 도달 가능성 검사: 안 되면 높은 벽을 낮은 벽으로 바꿈
+    const region = (fl, x) => walls.filter(w => w.full && w.fl === fl && w.x < x).length;
+    const reachable = () => {
+      const seen = new Set(), q = [[4, region(4, 40)]]; seen.add('4,' + q[0][1]);
+      while (q.length) {
+        const [fl, rg] = q.pop();
+        for (const l of ladders) for (const [a, b] of [[l.top, l.top + 1], [l.top + 1, l.top]])
+          if (fl === a && region(a, l.x) === rg) { const k = b + ',' + region(b, l.x); if (!seen.has(k)) { seen.add(k); q.push([b, region(b, l.x)]); } }
+      }
+      return [...foods, this.jar].every(f => seen.has(f.fl + ',' + region(f.fl, f.x)));
+    };
+    while (!reachable()) { const w = walls.filter(w => w.full).pop(); if (!w) break; w.full = false; }
+    // 적
+    for (let fl = n >= 10 ? 0 : 1; fl < 5; fl++) {
+      const c = 1 + (n >= 8 && r() < .5 ? 1 : 0);
+      for (let i = 0; i < c; i++) {
+        let type = Math.min(3, Math.floor(r() * (1 + n / 4)));
+        if (r() < .15) type = 3;
+        enemies.push({ fl, x: (fl === 4 ? 250 : 40) + r() * 340, dir: r() < .5 ? -1 : 1, type, sp: ENEMY[type].s * (1 + n * .01) });
+      }
+    }
+  }
+
+  startStage(keepMsg) {
+    this.build(this.diff); this.eaten = 0; this.resetPlayer(); this.timer = 99; this.tick = 0;
+    this.state = 'play'; this.msgT = keepMsg ? 0 : 100;
+  }
+  resetPlayer() { this.p = { x: 40, fl: 4, y: FY[4], py: 0, face: 1, mode: 'walk', t: 0, dx: 0, D: 0, H: 0, step: 0, lad: null, vy: 0, rot: 0, held: false }; }
+  die() { const p = this.p; if (p.mode === 'die') return; p.mode = 'die'; p.vy = -3; p.t = 0; beep(400, .6, 'sawtooth', .05, 80); }
+  inGap(fl, x) { return this.gaps[fl].some(([a, b]) => x > a && x < b); }
+
+  // ----- 갱신 -----
+  update() {
+    this.frame++;
+    if (this.state === 'finished' || this.state === 'over') return;
+    if (this.race) this.elapsed++;
+    if (this.state === 'clear') {
+      if (this.race) {
+        if (--this.clearT <= 0) { this.stage++; if (this.stage > this.N) { this.state = 'finished'; this.fin = this.elapsed; } else this.startStage(); }
+        return;
+      }
+      if (--this.clearT <= 0) {
+        if (this.timer > 1) { this.timer--; this.bonus += 20; this.score += 20; this.clearT = 1; beep(900, .03); }
+        else if (!this.done) { this.done = 1; this.clearT = 60; }
+        else { this.stage++; this.startStage(); }
+      }
+      return;
+    }
+    if (this.msgT > 0) this.msgT--;
+    const p = this.p, km = this.km;
+    const L = down(km.L), R = down(km.R), U = down(km.U), D = down(km.D), J = down(km.J);
+
+    if (p.mode === 'die') {
+      p.vy += .35; p.y += p.vy; p.rot = Math.min(Math.PI, p.rot + .25);
+      if (p.y > 500) {
+        p.y = 500; p.vy = 0;
+        if (++p.t > 70) {
+          if (this.race) { this.elapsed += PENALTY; this.penaltyT = 90; this.startStage(true); }
+          else {
+            this.lives--;
+            if (this.lives <= 0) { this.state = 'over'; this.best = Math.max(this.best, this.score); }
+            else { this.resetPlayer(); this.timer = 99; this.tick = 0; this.msgT = 90; }
+          }
+        }
+      }
+      return;
+    }
+    if (this.penaltyT > 0) this.penaltyT--;
+    if (++this.tick >= Math.max(30, 48 - this.diff)) { this.tick = 0; this.timer--; if (this.timer <= 1) { this.die(); return; } }
+
+    const prevX = p.x;
+    if (p.mode === 'walk') {
+      let moved = false;
+      if (L) { p.x -= 2; p.face = -1; moved = true; } else if (R) { p.x += 2; p.face = 1; moved = true; }
+      if (moved) p.step++;
+      if (this.inGap(p.fl, p.x)) { p.mode = 'fall'; p.vy = 0; }
+      else if (J && !p.held) {
+        p.held = true; p.mode = 'jump'; p.t = 0;
+        if (moved) { p.D = 34; p.H = 40; p.dx = 3 * p.face; } else { p.D = 18; p.H = 26; p.dx = 0; }
+        beep(500, .12, 'square', .03, 900);
+      } else if (U || D) {
+        const lad = this.ladders.find(l => Math.abs(l.x - p.x) <= 10 && ((U && l.top === p.fl - 1) || (D && l.top === p.fl)));
+        if (lad) { p.mode = 'ladder'; p.lad = lad; p.x = lad.x; }
+      }
+    } else if (p.mode === 'jump') {
+      p.t++; p.x += p.dx;
+      const u = p.t / p.D; p.py = p.H * 4 * u * (1 - u);
+    } else if (p.mode === 'ladder') {
+      const top = FY[p.lad.top], bot = FY[p.lad.top + 1];
+      if (U) p.y -= 1.6; else if (D) p.y += 1.6;
+      if (U || D) p.step++;
+      if (p.y <= top) { p.y = top; p.fl = p.lad.top; p.mode = 'walk'; }
+      else if (p.y >= bot) { p.y = bot; p.fl = p.lad.top + 1; p.mode = 'walk'; }
+    } else if (p.mode === 'fall') {
+      p.vy += .4; p.y += p.vy;
+      if (p.y > FY[p.fl] + 14) this.die();
+    }
+    if (!J) p.held = false;
+    p.x = Math.max(12, Math.min(628, p.x));
+    // 벽 충돌
+    if (p.mode === 'walk' || p.mode === 'jump') {
+      for (const w of this.walls) if (w.fl === p.fl && p.py < (w.full ? WALL_FULL : WALL_LOW) && Math.abs(p.x - w.x) < 12)
+        p.x = prevX < w.x ? w.x - 12 : w.x + 12;
+    }
+    if (p.mode === 'jump' && p.t >= p.D) { p.py = 0; p.mode = 'walk'; if (this.inGap(p.fl, p.x)) { p.mode = 'fall'; p.vy = 0; } }
+    if (p.mode !== 'ladder' && p.mode !== 'fall') p.y = FY[p.fl];
+    if (p.mode === 'die') return;
+
+    // 적
+    for (const e of this.enemies) {
+      e.x += e.dir * e.sp;
+      if (e.x < 14) { e.x = 14; e.dir = 1; }
+      if (e.x > 626) { e.x = 626; e.dir = -1; }
+      for (const w of this.walls) if (w.fl === e.fl && Math.abs(e.x - w.x) < 14) { e.dir = e.x < w.x ? -1 : 1; e.x = w.x + (e.dir < 0 ? -14 : 14); }
+      if (p.fl === e.fl && (p.mode === 'walk' || p.mode === 'jump') && Math.abs(e.x - p.x) < 18 && p.py < 14) { this.die(); return; }
+    }
+    if (p.mode === 'walk' || p.mode === 'jump') {
+      for (const k of this.tacks) if (k.fl === p.fl && Math.abs(k.x - p.x) < 9 && p.py < 7) { this.die(); return; }
+      for (let i = 0; i < this.foods.length; i++) {
+        const f = this.foods[i];
+        if (f.fl === p.fl && Math.abs(f.x - p.x) < 16 && p.py < 24) {
+          this.foods.splice(i, 1); this.score += SCORES[Math.min(this.eaten, 11)]; this.eaten++; beep(800, .1, 'triangle', .05, 1200); break;
+        }
+      }
+      const j = this.jar;
+      if (j && j.fl === p.fl && Math.abs(j.x - p.x) < 16 && p.py < 24) {
+        this.score += [500, 1000, 2000, 3000][Math.floor(Math.random() * 4)]; this.jar = null; beep(300, .25, 'triangle', .05, 1400);
+      }
+      if (!this.foods.length) { this.state = 'clear'; this.clearT = this.race ? 40 : 50; this.bonus = 0; this.done = 0; beep(1000, .4, 'triangle', .05, 1500); }
+    }
+  }
+
+  // ----- 그리기 -----
+  drawPlayer(p) {
+    const g = this.g, x = p.x, y = p.y - p.py, f = p.face;
+    g.save();
+    if (p.mode === 'die') { g.translate(x, y - 14); g.rotate(p.rot); g.translate(-x, -(y - 14)); }
+    const cy = y - 14;
+    g.fillStyle = '#9a9aa5';
+    g.beginPath(); g.ellipse(x - f * 13, cy + 4, 9, 5, -f * .5, 0, 7); g.fill();
+    g.fillStyle = '#333'; g.fillRect(x - f * 15 - 1, cy + 1, 3, 6); g.fillRect(x - f * 10 - 1, cy - 1, 3, 6);
+    g.fillStyle = '#9a9aa5';
+    g.beginPath(); g.ellipse(x, cy + 2, 10, 11, 0, 0, 7); g.fill();
+    g.beginPath(); g.arc(x, cy - 6, 9, 0, 7); g.fill();
+    g.beginPath(); g.arc(x - 7, cy - 13, 3.5, 0, 7); g.arc(x + 7, cy - 13, 3.5, 0, 7); g.fill();
+    g.fillStyle = '#222'; g.fillRect(x - 9, cy - 9, 18, 5);
+    g.fillStyle = '#fff'; g.fillRect(x - 6, cy - 8, 4, 3); g.fillRect(x + 2, cy - 8, 4, 3);
+    g.fillStyle = '#000'; g.fillRect(x - 5 + f, cy - 7, 2, 2); g.fillRect(x + 3 + f, cy - 7, 2, 2);
+    g.fillRect(x + f * 6 - 2, cy - 3, 4, 3);
+    const k = p.mode === 'walk' || p.mode === 'ladder' ? Math.floor(p.step / 5) % 2 : 0;
+    g.fillStyle = '#333'; g.fillRect(x - 7, cy + 11 + k, 5, 3); g.fillRect(x + 2, cy + 11 + (1 - k), 5, 3);
+    g.restore();
+  }
+
+  drawEnemy(e) {
+    const g = this.g, et = ENEMY[e.type], y = FY[e.fl], x = e.x, w = Math.sin(this.frame / 6 + e.x);
+    g.fillStyle = et.c;
+    if (et.snake) {
+      for (let i = 0; i < 6; i++) { g.beginPath(); g.arc(x - e.dir * i * 5, y - 5 + Math.sin(this.frame / 8 + i) * 2, 4.5 - i * .2, 0, 7); g.fill(); }
+      g.fillStyle = '#f44'; g.fillRect(x + e.dir * 5, y - 5, 4 * e.dir, 1);
+    } else {
+      for (let i = 0; i < 4; i++) { g.beginPath(); g.arc(x - e.dir * i * 7 + 7 * e.dir, y - 7 - (i % 2) * 2 * w, 7, 0, 7); g.fill(); }
+      g.fillStyle = '#fff'; g.fillRect(x + e.dir * 10 - 3, y - 14, 3, 4); g.fillRect(x + e.dir * 10 + 1, y - 14, 3, 4);
+      g.fillStyle = '#000'; g.fillRect(x + e.dir * 10 - 2 + e.dir, y - 13, 2, 2); g.fillRect(x + e.dir * 10 + 2 + e.dir, y - 13, 2, 2);
+    }
+  }
+
+  draw() {
+    const g = this.g;
+    g.fillStyle = '#0a0a2a'; g.fillRect(0, 0, 640, 512);
+    g.textBaseline = 'middle'; g.font = 'bold 18px "Malgun Gothic",sans-serif';
+    g.fillStyle = '#fff'; g.textAlign = 'left';
+    g.fillText((this.name ? this.name + '  ' : '') + '점수 ' + this.score, 12, 20);
+    g.textAlign = 'center';
+    g.fillText(this.race ? '스테이지 ' + Math.min(this.stage, this.N) + '/' + this.N + '   ' + this.foodIcon : '스테이지 ' + this.stage + '   ' + this.foodIcon, 320, 20);
+    g.textAlign = 'right';
+    g.fillText(this.race ? fmt(this.state === 'finished' ? this.fin : this.elapsed) + (this.penaltyT > 0 ? ' (+5초)' : '') : '최고 ' + this.best + '   목숨 ' + '♥'.repeat(Math.max(this.lives, 0)), 628, 20);
+    g.textAlign = 'left'; g.fillText('시간', 12, 52);
+    g.fillStyle = '#333'; g.fillRect(64, 44, 560, 16);
+    g.fillStyle = this.timer < 20 ? '#ff5252' : '#66bb6a'; g.fillRect(64, 44, 560 * Math.max(0, this.timer) / 99, 16);
+
+    for (let fl = 0; fl < 5; fl++) {
+      const segs = []; let x = 0;
+      for (const [a, b] of this.gaps[fl].slice().sort((u, v) => u[0] - v[0])) { segs.push([x, a]); x = b; }
+      segs.push([x, 640]);
+      for (const [a, b] of segs) {
+        g.fillStyle = '#b5532a'; g.fillRect(a, FY[fl], b - a, 10);
+        g.fillStyle = '#e07a45'; g.fillRect(a, FY[fl], b - a, 2);
+        g.fillStyle = '#7a3418'; for (let xx = a - a % 16 + 8; xx < b; xx += 16) if (xx > a) g.fillRect(xx, FY[fl] + 3, 2, 7);
+      }
+    }
+    for (const l of this.ladders) {
+      const y0 = FY[l.top], y1 = FY[l.top + 1];
+      g.fillStyle = '#e8d44d'; g.fillRect(l.x - 11, y0, 3, y1 - y0); g.fillRect(l.x + 8, y0, 3, y1 - y0);
+      for (let y = y0 + 6; y < y1; y += 10) g.fillRect(l.x - 9, y, 18, 3);
+    }
+    for (const w of this.walls) {
+      const h = w.full ? WALL_FULL : WALL_LOW, top = FY[w.fl] - h;
+      g.fillStyle = w.full ? '#8d6e63' : '#a1887f'; g.fillRect(w.x - 5, top, 10, h);
+      g.fillStyle = '#4e342e';
+      for (let y = top + 6; y < FY[w.fl]; y += 8) g.fillRect(w.x - 5, y, 10, 1);
+      g.fillRect(w.x - 5, top, 10, 2);
+    }
+    for (const k of this.tacks) {
+      g.fillStyle = '#cfd8dc'; g.beginPath(); g.moveTo(k.x - 7, FY[k.fl]); g.lineTo(k.x, FY[k.fl] - 10); g.lineTo(k.x + 7, FY[k.fl]); g.fill();
+      g.fillStyle = '#f44'; g.fillRect(k.x - 1, FY[k.fl] - 11, 2, 3);
+    }
+    g.textAlign = 'center'; g.font = '22px "Segoe UI Emoji","Apple Color Emoji",sans-serif'; g.fillStyle = '#fff';
+    for (const f of this.foods) g.fillText(this.foodIcon, f.x, FY[f.fl] - 14);
+    const j = this.jar;
+    if (j) { g.fillStyle = '#8d5a2b'; g.beginPath(); g.ellipse(j.x, FY[j.fl] - 10, 10, 11, 0, 0, 7); g.fill(); g.fillStyle = '#ffd54f'; g.font = 'bold 14px sans-serif'; g.fillText('?', j.x, FY[j.fl] - 10); }
+    this.enemies.forEach(e => this.drawEnemy(e));
+    this.drawPlayer(this.p);
+
+    g.textAlign = 'center'; g.font = 'bold 30px "Malgun Gothic",sans-serif'; g.fillStyle = '#ffd54f';
+    if (this.state === 'play' && this.msgT > 0 && !this.race) g.fillText('스테이지 ' + this.stage + '  준비!', 320, 110);
+    if (this.state === 'clear' && !this.race) g.fillText('스테이지 클리어!  보너스 +' + this.bonus, 320, 110);
+    if (this.state === 'finished') { g.fillStyle = 'rgba(0,0,0,.6)'; g.fillRect(0, 200, 640, 100); g.fillStyle = '#ffd54f'; g.fillText('전 스테이지 클리어!  ' + fmt(this.fin), 320, 250); }
+    if (this.state === 'over') {
+      g.fillStyle = 'rgba(0,0,0,.7)'; g.fillRect(0, 170, 640, 170);
+      g.fillStyle = '#ff5252'; g.font = 'bold 54px "Malgun Gothic",sans-serif'; g.fillText('게임 오버', 320, 230);
+      g.fillStyle = '#fff'; g.font = '22px "Malgun Gothic",sans-serif'; g.fillText('Enter 키로 메뉴로', 320, 295);
+    }
+  }
+}
+
+const fmt = f => { const s = f / 60; return Math.floor(s / 60) + ':' + (s % 60).toFixed(1).padStart(4, '0'); };
+
+// ----- 메뉴 / 모드 관리 -----
+const c1 = document.getElementById('c1'), c2 = document.getElementById('c2'), help = document.getElementById('help');
+let mode = 'title', games = [], countdown = 0, result = null, tf = 0, best = 0;
+
+function startSolo() {
+  mode = 'solo'; c2.style.display = 'none'; games = [new Game(c1, KEYMAP.solo, { best })];
+  help.textContent = '← → ↑ ↓ (또는 WASD) : 이동/사다리  |  스페이스(F) : 점프 — 멈춰서 숏 점프, 달리면서 롱 점프  |  Esc : 메뉴';
+}
+function startRace(N) {
+  mode = 'race'; c2.style.display = ''; result = null; countdown = 180;
+  games = [new Game(c1, KEYMAP.p1, { race: true, N, name: '1P' }), new Game(c2, KEYMAP.p2, { race: true, N, name: '2P' })];
+  help.textContent = '1P: W A S D 이동, F 점프   |   2P: ← → ↑ ↓ 이동, / 점프   |   Esc : 메뉴';
+}
+function toTitle() { mode = 'title'; c2.style.display = 'none'; games = []; help.textContent = ''; }
+
+function onKey(code) {
+  if (code === 'Escape') { toTitle(); return; }
+  if (mode === 'title') {
+    if (code === 'Digit1' || code === 'Numpad1') startSolo();
+    else if (code === 'Digit2' || code === 'Numpad2') startRace(5);
+    else if (code === 'Digit3' || code === 'Numpad3') startRace(10);
+    else if (code === 'Digit4' || code === 'Numpad4') startRace(20);
+  } else if (code === 'Enter' && (mode === 'raceover' || (mode === 'solo' && games[0].state === 'over'))) {
+    if (mode === 'solo') best = Math.max(best, games[0].best);
+    toTitle();
+  }
+}
+
+function step() {
+  if (mode === 'title') { tf++; return; }
+  if (mode === 'solo') { games[0].update(); return; }
+  if (mode === 'race') {
+    if (countdown > 0) { countdown--; return; }
+    games.forEach(g => g.update());
+    const [a, b] = games, fa = a.state === 'finished', fb = b.state === 'finished';
+    if (fa || fb) {
+      mode = 'raceover';
+      result = fa && fb ? (a.fin < b.fin ? 0 : b.fin < a.fin ? 1 : -1) : fa ? 0 : 1;
+    }
+  }
+}
+
+function drawTitle() {
+  const g = c1.getContext('2d');
+  g.fillStyle = '#0a0a2a'; g.fillRect(0, 0, 640, 512);
+  g.fillStyle = '#b5532a'; g.fillRect(0, 400, 640, 10);
+  g.textAlign = 'center'; g.textBaseline = 'middle';
+  g.fillStyle = '#ffd54f'; g.font = 'bold 72px "Malgun Gothic",sans-serif'; g.fillText('너구리', 320, 90);
+  g.fillStyle = '#fff'; g.font = '22px "Malgun Gothic",sans-serif';
+  g.fillText('1  혼자 하기', 320, 190);
+  g.fillText('2  2인 대결 (5 스테이지)', 320, 230);
+  g.fillText('3  2인 대결 (10 스테이지)', 320, 270);
+  g.fillText('4  2인 대결 (20 스테이지)', 320, 310);
+  g.fillStyle = '#aaa'; g.font = '15px "Malgun Gothic",sans-serif';
+  g.fillText('대결: 같은 스테이지를 동시에 시작해 먼저 전부 깨는 사람이 승리 (죽으면 스테이지 재시작 + 5초 페널티)', 320, 350);
+  const dummy = new Game(c1, KEYMAP.solo, {}).p;
+  Object.assign(dummy, { x: 320 + Math.sin(tf / 20) * 200, y: 400, face: Math.cos(tf / 20) > 0 ? 1 : -1, step: tf, mode: 'walk', py: 0 });
+  Game.prototype.drawPlayer.call({ g }, dummy);
+}
+
+function overlay(game, text, sub) {
+  const g = game.g;
+  g.fillStyle = 'rgba(0,0,0,.55)'; g.fillRect(0, 170, 640, 170);
+  g.textAlign = 'center'; g.textBaseline = 'middle'; g.fillStyle = '#ffd54f';
+  g.font = 'bold 64px "Malgun Gothic",sans-serif'; g.fillText(text, 320, 225);
+  g.fillStyle = '#fff'; g.font = '22px "Malgun Gothic",sans-serif'; g.fillText(sub, 320, 290);
+}
+
+function render() {
+  if (mode === 'title') { drawTitle(); return; }
+  games.forEach(g => g.draw());
+  if (mode === 'race' && countdown > 0) {
+    const t = Math.ceil(countdown / 60);
+    games.forEach(g => overlay(g, String(t), '준비!'));
+  } else if (mode === 'race' && games[0].elapsed < 60) {
+    games.forEach(g => overlay(g, 'GO!', ''));
+  }
+  if (mode === 'raceover') {
+    games.forEach((g, i) => {
+      const win = result === i, tie = result === -1;
+      overlay(g, tie ? '무승부' : win ? '승리!' : '패배',
+        (g.state === 'finished' ? fmt(g.fin) : g.stage + '/' + g.N + ' 스테이지 진행') + '   |   Enter : 메뉴');
+    });
+  }
+}
+
+let last = performance.now(), acc = 0;
+(function loop(now) {
+  acc += Math.min(100, now - last); last = now;
+  while (acc >= 1000 / 60) { acc -= 1000 / 60; step(); }
+  render(); requestAnimationFrame(loop);
+})(last);
+</script>
+</body>
+</html>
